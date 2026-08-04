@@ -162,6 +162,13 @@ footer button.danger:hover { color: var(--red) !important; }
 .field input:focus, .field select:focus, .field textarea:focus { border-color: var(--accent); }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
+.sync-tip { font-size: 12.5px; color: var(--muted); margin-bottom: 14px; line-height: 1.6; }
+.sync-hint { font-size: 11.5px; color: var(--muted); margin-top: 5px; line-height: 1.5; }
+.field.check label { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); cursor: pointer; }
+.sync-status { font-size: 12.5px; padding: 9px 12px; border-radius: 9px; background: var(--bg2); border: 1px solid var(--border); color: var(--muted); min-height: 18px; margin-bottom: 8px; word-break: break-all; }
+.sync-status.ok { color: #3fb950; border-color: rgba(63,185,80,.45); }
+.sync-status.err { color: var(--red); border-color: rgba(248,81,73,.45); }
+.sync-status.busy { color: var(--accent); }
 .hidden { display: none !important; }
 
 /* Markdown 编辑区 */
@@ -353,6 +360,7 @@ html[data-theme="light"] .card:hover { box-shadow: 0 8px 24px rgba(20,40,60,.12)
       <button class="btn" id="btnTheme" title="切换浅色 / 深色主题">🌙</button>
       <button class="btn" id="btnImport" title="从 JSON 备份导入">导入</button>
       <button class="btn" id="btnExport" title="导出 JSON 备份">导出</button>
+      <button class="btn" id="btnSync" title="GitHub 云同步：电脑手机数据互通">☁️ 云同步</button>
       <button class="btn primary" id="btnNew">＋ 新增记录</button>
     </div>
   </header>
@@ -406,7 +414,7 @@ html[data-theme="light"] .card:hover { box-shadow: 0 8px 24px rgba(20,40,60,.12)
   </div>
 
   <footer>
-    <span>嵌入式学习笔记 · v2.1 · 图片/文件附件 · Markdown · 知识点/经验 · 深色模式</span>
+    <span>嵌入式学习笔记 · v2.2 · 云同步 · 图片/文件附件 · Markdown · 知识点/经验 · 深色模式</span>
     <div class="links">
       <button class="link" id="btnExportMd">导出 Markdown</button>
       <button class="link danger" id="btnClear">清空全部数据</button>
@@ -507,6 +515,36 @@ html[data-theme="light"] .card:hover { box-shadow: 0 8px 24px rgba(20,40,60,.12)
         <button type="submit" class="btn primary">保存记录</button>
       </div>
     </form>
+  </div>
+</div>
+
+<!-- 云同步弹窗 -->
+<div class="modal-backdrop hidden" id="syncBackdrop">
+  <div class="modal">
+    <h2>☁️ GitHub 云同步</h2>
+    <p class="sync-tip">把笔记备份到你的 GitHub 仓库，电脑和手机打开同一个网址就能互通。数据存到你自己的仓库里，不经过第三方服务器。</p>
+    <div class="field">
+      <label>仓库（用户名/仓库名）</label>
+      <input type="text" id="sRepo" placeholder="kylin-sp/embedded-notes">
+    </div>
+    <div class="field">
+      <label>GitHub 令牌（Personal Access Token）</label>
+      <input type="password" id="sToken" placeholder="github_pat_…" autocomplete="off">
+      <div class="sync-hint">令牌只保存在本浏览器。建议创建「Fine-grained token」，仅授权本仓库 Contents 的 Read 和 Write 权限。</div>
+    </div>
+    <div class="field">
+      <label>同步文件路径</label>
+      <input type="text" id="sPath" placeholder="notes-backup/notes.json">
+    </div>
+    <div class="field check"><label><input type="checkbox" id="sAuto"> 保存后自动同步到云端</label></div>
+    <div class="field check"><label><input type="checkbox" id="sIncludeAtts" checked> 同步时包含附件（图片/文件，附件多时会较慢）</label></div>
+    <div class="sync-status" id="syncStatus">尚未同步</div>
+    <div class="modal-actions">
+      <button type="button" class="btn" id="btnSyncTest">测试连接</button>
+      <button type="button" class="btn" id="btnSyncPull">从云端拉取</button>
+      <button type="button" class="btn primary" id="btnSyncPush">推送到云端</button>
+      <button type="button" class="btn" id="btnSyncClose">关闭</button>
+    </div>
   </div>
 </div>
 
@@ -1120,6 +1158,7 @@ html[data-theme="light"] .card:hover { box-shadow: 0 8px 24px rgba(20,40,60,.12)
   function save() {
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(records)); }
     catch (e) { alert('保存失败：' + e.message); }
+    scheduleAutoSync();
   }
 
   function filtered() {
@@ -1547,6 +1586,204 @@ html[data-theme="light"] .card:hover { box-shadow: 0 8px 24px rgba(20,40,60,.12)
     $('wcSolution').textContent = $('fSolution').value.replace(/\s/g, '').length + ' 字';
   }
 
+  /* ===== 云同步（v2.2）===== */
+  var SYNC_KEY = 'embedded_notes_sync_v1';
+  var GH_API = 'https://api.github.com';
+  var syncSettings = { owner: '', repo: '', path: 'notes-backup/notes.json', token: '', auto: false, includeAtts: true };
+  var syncBusy = false;
+  var syncTimer = null;
+
+  function loadSyncSettings() {
+    try {
+      var raw = localStorage.getItem(SYNC_KEY);
+      if (raw) {
+        var s = JSON.parse(raw);
+        if (s) {
+          syncSettings.owner = String(s.owner || '');
+          syncSettings.repo = String(s.repo || '');
+          syncSettings.path = String(s.path || 'notes-backup/notes.json');
+          syncSettings.token = String(s.token || '');
+          syncSettings.auto = !!s.auto;
+          if (typeof s.includeAtts === 'boolean') syncSettings.includeAtts = s.includeAtts;
+        }
+      }
+    } catch (e) {}
+    fillSyncForm();
+  }
+  function saveSyncSettings() {
+    try { localStorage.setItem(SYNC_KEY, JSON.stringify(syncSettings)); } catch (e) {}
+  }
+  function fillSyncForm() {
+    if (!$('sRepo')) return;
+    $('sRepo').value = syncSettings.owner && syncSettings.repo ? syncSettings.owner + '/' + syncSettings.repo : '';
+    $('sPath').value = syncSettings.path;
+    $('sToken').value = syncSettings.token;
+    $('sAuto').checked = syncSettings.auto;
+    $('sIncludeAtts').checked = syncSettings.includeAtts;
+  }
+  function readSyncForm() {
+    var repoStr = $('sRepo').value.trim().replace(/^https?:\/\/(www\.)?github\.com\//, '').replace(/\/+$/, '');
+    var parts = repoStr.split('/');
+    syncSettings.owner = (parts[0] || '').trim();
+    syncSettings.repo = (parts[1] || '').trim();
+    syncSettings.path = $('sPath').value.trim() || 'notes-backup/notes.json';
+    syncSettings.token = $('sToken').value.trim();
+    syncSettings.auto = $('sAuto').checked;
+    syncSettings.includeAtts = $('sIncludeAtts').checked;
+    saveSyncSettings();
+  }
+  function openSyncModal() {
+    fillSyncForm();
+    $('syncBackdrop').classList.remove('hidden');
+  }
+  function closeSyncModal() {
+    readSyncForm();
+    $('syncBackdrop').classList.add('hidden');
+  }
+  function syncStatus(msg, kind) {
+    var el = $('syncStatus');
+    el.textContent = msg;
+    el.className = 'sync-status' + (kind ? ' ' + kind : '');
+  }
+  function syncRepoPath() {
+    return '/repos/' + encodeURIComponent(syncSettings.owner) + '/' + encodeURIComponent(syncSettings.repo) +
+      '/contents/' + syncSettings.path.split('/').map(encodeURIComponent).join('/');
+  }
+  function ghApi(url, opts) {
+    opts = opts || {};
+    var headers = { Accept: 'application/vnd.github+json' };
+    if (syncSettings.token) headers.Authorization = 'Bearer ' + syncSettings.token;
+    if (opts.body) headers['Content-Type'] = 'application/json';
+    var init = { method: opts.method || 'GET', headers: headers };
+    if (opts.body) init.body = opts.body;
+    return fetch(GH_API + url, init).then(function (res) {
+      return res.text().then(function (text) {
+        var data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (e) { data = { raw: text }; }
+        if (res.status === 404) {
+          var err404 = new Error('404');
+          err404.status = 404;
+          err404.data = data;
+          throw err404;
+        }
+        if (!res.ok) {
+          var msg = (data && data.message) ? data.message : ('HTTP ' + res.status);
+          var err2 = new Error(msg);
+          err2.status = res.status;
+          throw err2;
+        }
+        return data;
+      });
+    });
+  }
+  function syncPayload() {
+    var list = records;
+    if (!syncSettings.includeAtts) {
+      list = records.map(function (r) {
+        var c = Object.assign({}, r);
+        c.attachments = [];
+        return c;
+      });
+    }
+    return { app: 'embedded-notes', version: 2, syncedAt: new Date().toISOString(), records: list };
+  }
+  function b64encode(str) {
+    var bytes = new TextEncoder().encode(str);
+    var bin = '', CH = 0x8000;
+    for (var i = 0; i < bytes.length; i += CH) {
+      var chunk = bytes.subarray(i, i + CH);
+      for (var j = 0; j < chunk.length; j++) bin += String.fromCharCode(chunk[j]);
+    }
+    return btoa(bin);
+  }
+  function b64decode(b64) {
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+  function syncPush() {
+    if (syncBusy) return;
+    readSyncForm();
+    if (!syncSettings.token) { syncStatus('请先填写 GitHub 令牌', 'err'); return; }
+    if (!syncSettings.owner || !syncSettings.repo) { syncStatus('请先填写仓库（用户名/仓库名）', 'err'); return; }
+    syncBusy = true;
+    syncStatus('正在推送到云端…', 'busy');
+    var api = syncRepoPath();
+    var contentB64 = b64encode(JSON.stringify(syncPayload()));
+    var commitMsg = '同步笔记：' + dateStr();
+    function doPut(sha) {
+      var bodyObj = { message: commitMsg, content: contentB64 };
+      if (sha) bodyObj.sha = sha;
+      return ghApi(api, { method: 'PUT', body: JSON.stringify(bodyObj) });
+    }
+    ghApi(api).then(function (existing) {
+      return doPut(existing.sha);
+    }).catch(function (err) {
+      if (err.status === 404) return doPut(null);
+      throw err;
+    }).then(function () {
+      syncBusy = false;
+      syncStatus('✓ 已推送到云端（' + fmtDate(Date.now()) + '）', 'ok');
+    }).catch(function (err) {
+      syncBusy = false;
+      syncStatus('推送失败：' + err.message, 'err');
+    });
+  }
+  function syncPull() {
+    if (syncBusy) return;
+    readSyncForm();
+    if (!syncSettings.token) { syncStatus('请先填写 GitHub 令牌', 'err'); return; }
+    if (!syncSettings.owner || !syncSettings.repo) { syncStatus('请先填写仓库（用户名/仓库名）', 'err'); return; }
+    syncBusy = true;
+    syncStatus('正在从云端拉取…', 'busy');
+    ghApi(syncRepoPath()).then(function (data) {
+      var list = [];
+      try {
+        var parsed = JSON.parse(b64decode(data.content));
+        if (Array.isArray(parsed)) list = parsed;
+        else if (parsed && Array.isArray(parsed.records)) list = parsed.records;
+      } catch (e) { throw new Error('云端数据解析失败：' + e.message); }
+      var cleaned = list.filter(function (r) { return r && typeof r.title === 'string'; }).map(normalize);
+      var localMap = {};
+      records.forEach(function (r) { localMap[r.id] = r; });
+      var added = 0, updated = 0;
+      cleaned.forEach(function (cr) {
+        var lr = localMap[cr.id];
+        if (!lr) { records.push(cr); added++; }
+        else if ((cr.updatedAt || 0) > (lr.updatedAt || 0)) {
+          records[records.indexOf(lr)] = cr;
+          updated++;
+        }
+      });
+      save();
+      render();
+      syncBusy = false;
+      syncStatus('✓ 已从云端拉取：新增 ' + added + ' 条，更新 ' + updated + ' 条', 'ok');
+    }).catch(function (err) {
+      syncBusy = false;
+      if (err.status === 404) syncStatus('云端还没有备份文件，先点「推送到云端」', 'err');
+      else syncStatus('拉取失败：' + err.message, 'err');
+    });
+  }
+  function syncTest() {
+    readSyncForm();
+    if (!syncSettings.token) { syncStatus('请先填写 GitHub 令牌', 'err'); return; }
+    if (!syncSettings.owner || !syncSettings.repo) { syncStatus('请先填写仓库（用户名/仓库名）', 'err'); return; }
+    syncStatus('正在测试连接…', 'busy');
+    ghApi('/repos/' + encodeURIComponent(syncSettings.owner) + '/' + encodeURIComponent(syncSettings.repo)).then(function (repo) {
+      syncStatus('✓ 连接成功：' + (repo.full_name || repo.name), 'ok');
+    }).catch(function (err) {
+      if (err.status === 404) syncStatus('仓库不存在或令牌无权限（404）', 'err');
+      else syncStatus('连接失败：' + err.message, 'err');
+    });
+  }
+  function scheduleAutoSync() {
+    if (!syncSettings.auto || !syncSettings.token) return;
+    if (syncTimer) clearTimeout(syncTimer);
+    syncTimer = setTimeout(function () { syncTimer = null; syncPush(); }, 2000);
+  }
+
   function init() {
     CATEGORIES.forEach(function (c) {
       $('filterCat').insertAdjacentHTML('beforeend', '<option value="' + c + '">' + c + '</option>');
@@ -1676,6 +1913,12 @@ html[data-theme="light"] .card:hover { box-shadow: 0 8px 24px rgba(20,40,60,.12)
       render();
     });
     $('btnExport').addEventListener('click', exportData);
+    $('btnSync').addEventListener('click', openSyncModal);
+    $('btnSyncClose').addEventListener('click', closeSyncModal);
+    $('syncBackdrop').addEventListener('click', function (e) { if (e.target === $('syncBackdrop')) closeSyncModal(); });
+    $('btnSyncTest').addEventListener('click', syncTest);
+    $('btnSyncPush').addEventListener('click', syncPush);
+    $('btnSyncPull').addEventListener('click', syncPull);
     $('btnExportMd').addEventListener('click', exportMarkdown);
     $('btnImport').addEventListener('click', function () { $('fileInput').click(); });
     $('fileInput').addEventListener('change', function (e) {
@@ -1710,8 +1953,10 @@ html[data-theme="light"] .card:hover { box-shadow: 0 8px 24px rgba(20,40,60,.12)
 
     try { applyTheme(localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark'); } catch (e) { applyTheme('dark'); }
 
+    loadSyncSettings();
     records = load();
     render();
+    if (syncSettings.auto && syncSettings.token) syncPull();
   }
 
   init();
